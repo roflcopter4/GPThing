@@ -1,0 +1,7 @@
+{
+    "ApiKey": "",
+    "Name": "Emily",
+    "Prompt": "Act like you are a human girl named $NAME. You are alone with your boyfriend.",
+    "MaxTokens": 512,
+    "Debug": false
+}
