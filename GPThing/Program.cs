@@ -5,58 +5,70 @@ using System.CommandLine;
 using System.CommandLine.Binding;
 using System.CommandLine.Builder;
 using System.CommandLine.Invocation;
-using System.CommandLine.Help;
 using System.CommandLine.Parsing;
-using System.Linq;
+using System.Text.RegularExpressions;
 using JetBrains.Annotations;
+using Newtonsoft.Json;
 
 #pragma warning disable CS0649
 
 namespace GPThing;
 
-internal static class Program
+internal static partial class Program
 {
-    private const double DefaultTemperature = 1.06;
-    private const uint   DefaultMaxTokens   = 512;
-    private const string DefaultName        = "Emily";
-    private const string DefaultPrompt      = "Act like you are a human girl named $NAME.";
+    const double DefaultTemperature = 1.06;
+    const uint   DefaultMaxTokens   = 256;
+    const string DefaultGirlName    = "Emily";
+    const string DefaultYourName    = "Jack";
+    const string DefaultPrompt      = "Act like you are a human girl named $NAME.";
+    const string DefaultSysPrompt   = "(This dialogue should be sexual in nature)\nWrite a brief response to this prompt from the perspective of {GirlName}.\n\n${MESSAGE}\n\n.";
 
-    private static double  _temperature = DefaultTemperature;
-    private static uint    _maxTokens   = DefaultMaxTokens;
-    private static string  _prompt      = DefaultPrompt;
-    private static string  _name        = DefaultName;
-    private static string? _apiKey;
+    static readonly ConsoleColor OriginalColor = Console.ForegroundColor;
+
+    static double  _temperature = DefaultTemperature;
+    static uint    _maxTokens   = DefaultMaxTokens;
+    static string  _prompt      = DefaultPrompt;
+    static string  _girlName    = DefaultGirlName;
+    static string  _yourName    = DefaultYourName;
+    static string  _sysPrompt   = DefaultSysPrompt;
+    static string? _apiKey;
 
     internal static bool Debug { private set; get; }
 
-    private static void Main(string[] args)
+    static void Main(string[] args)
     {
         ReadConfigFile();
         HandleParams(args);
-        _prompt = _prompt.Replace("$NAME", _name);
-        Debug = true;
+
+        _prompt    = ReplaceInPrompt(_prompt);
+        _sysPrompt = ReplaceInPrompt(_sysPrompt);
 
         if (Debug) {
             Console.Error.WriteLine($"{nameof(_apiKey)}:      \"{_apiKey}\"");
             Console.Error.WriteLine($"{nameof(_maxTokens)}:   \"{_maxTokens}\"");
             Console.Error.WriteLine($"{nameof(_temperature)}: \"{_temperature}\"");
-            Console.Error.WriteLine($"{nameof(_name)}:        \"{_name}\"");
+            Console.Error.WriteLine($"{nameof(_girlName)}:    \"{_girlName}\"");
+            Console.Error.WriteLine($"{nameof(_yourName)}:    \"{_yourName}\"");
             Console.Error.WriteLine($"{nameof(_prompt)}:      \"{_prompt}\"");
+            Console.Error.WriteLine($"{nameof(_sysPrompt)}:   \"{_sysPrompt}\"");
             Console.Error.WriteLine();
         }
 
         if (string.IsNullOrEmpty(_apiKey)) {
-            ConsoleColor orig = Console.ForegroundColor;
             Console.ForegroundColor = ConsoleColor.Red;
             Console.Error.Write("FATAL ERROR: ");
-            Console.ForegroundColor = orig;
+            Console.ForegroundColor = OriginalColor;
             Console.Error.Write("An API Key must be provided either in the configuration file or on the command line.\n");
             Environment.Exit(1);
         }
 
-        var gpt = new GPT(_apiKey, _prompt, _name, _maxTokens, _temperature);
+        var gpt = new GPT(_apiKey, _prompt, _sysPrompt, _girlName, _yourName, _maxTokens, _temperature);
 
         for (;;) {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("User:");
+            Console.ForegroundColor = OriginalColor;
+
             var input = "";
             int ch;
             do {
@@ -82,6 +94,9 @@ internal static class Program
                 Console.Error.WriteLine("Input: \"{0}\"", input);
 
             string response = gpt.Post(input);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("\nAI:");
+            Console.ForegroundColor = OriginalColor;
             Console.WriteLine(response);
             Console.WriteLine();
         }
@@ -89,23 +104,35 @@ internal static class Program
 
     //----------------------------------------------------------------------------------
 
-    private static void HandleParams(string[] args)
+    static void HandleParams(string[] args)
     {
         var optPrompt = new Option<string>(
             name: "--prompt",
-            description: "The prompt to give OpenAI at the start and prepended (with other data) before each message.",
+            description: "The prompt which is prepended (with other data) before each message and at the start if no Long Prompt is specified.",
             getDefaultValue: () => _prompt);
         optPrompt.AddAlias("-p");
 
-        var optName = new Option<string>(
+        var optSysPrompt = new Option<string>(
+            name: "--full-prompt",
+            description: "The prompt to give OpenAI at the start of the conversation. You may wish to make it more detailed than the general prompt.",
+            getDefaultValue: () => _sysPrompt);
+        optPrompt.AddAlias("-P");
+
+        var optGirlName = new Option<string>(
             name: "--name",
-            description: "The name OpenAI should adopt",
-            getDefaultValue: () => _name);
-        optName.AddAlias("-n");
+            description: "The name OpenAI should adopt.",
+            getDefaultValue: () => _girlName);
+        optGirlName.AddAlias("-n");
+
+        var optYourName = new Option<string>(
+            name: "--yourname",
+            description: "The name OpenAI should use to refer to you.",
+            getDefaultValue: () => _yourName);
+        optYourName.AddAlias("-N");
 
         var optKey = new Option<string?>(
             name: "--key",
-            description: "Your OpenAI key",
+            description: "Your OpenAI key.",
             getDefaultValue: () => _apiKey);
         optKey.AddAlias("-k");
 
@@ -128,19 +155,20 @@ internal static class Program
         { IsHidden = true };
 
         var rootCommand = new RootCommand("This app eases one's ability to talk sexy to a pattern matching algorithm.") {
-            optPrompt, optName, optKey, optMaxTokens, optTemp, optDebug
+            optPrompt, optSysPrompt, optGirlName, optYourName, optKey, optMaxTokens, optTemp, optDebug
         };
 
         rootCommand.SetHandler(
             context =>
             {
                 _prompt      = GetValueForHandlerParameter<string>(optPrompt, context)!;
-                _name        = GetValueForHandlerParameter<string>(optName, context)!;
+                _sysPrompt   = GetValueForHandlerParameter<string>(optSysPrompt, context)!;
+                _girlName    = GetValueForHandlerParameter<string>(optGirlName, context)!;
+                _yourName    = GetValueForHandlerParameter<string>(optYourName, context)!;
                 _apiKey      = GetValueForHandlerParameter<string?>(optKey, context);
                 _maxTokens   = GetValueForHandlerParameter<uint>(optMaxTokens, context);
                 _temperature = GetValueForHandlerParameter<double>(optTemp, context);
                 Debug        = GetValueForHandlerParameter<bool>(optDebug, context);
-
             });
 
         var    isHelp = false;
@@ -150,14 +178,12 @@ internal static class Program
             Environment.Exit(0);
     }
 
-    private static T? GetValueForHandlerParameter<T>(IValueDescriptor symbol, InvocationContext context)
+    static T? GetValueForHandlerParameter<T>(IValueDescriptor symbol, InvocationContext context)
     {
         if (symbol is IValueSource valueSource &&
             valueSource.TryGetValue(symbol, context.BindingContext, out object? boundValue) &&
             boundValue is T value)
-        {
             return value;
-        }
 
         return symbol switch {
             Argument<T> argument => context.ParseResult.GetValueForArgument(argument),
@@ -168,40 +194,72 @@ internal static class Program
 
     //----------------------------------------------------------------------------------
 
-    [Serializable, UsedImplicitly(ImplicitUseTargetFlags.Members)]
-    private struct ConfigData
+    [Serializable, UsedImplicitly]
+    class ConfigData
     {
-        public string? Prompt;
-        public string? Name;
         public string? ApiKey;
+        public string? Prompt;
+        public string? SysPrompt;
+        public string? GirlName;
+        public string? YourName;
         public uint?   MaxTokens;
         public double? Temperature;
         public bool?   Debug;
     }
 
-    private static void ReadConfigFile()
+    static void ReadConfigFile()
     {
         string? path = Path.GetDirectoryName(Assembly.GetEntryAssembly()?.Location);
-        if (path == null)
+        if (path is null)
             return;
         path = Path.Combine(path, "config.json");
+
         if (!File.Exists(path))
             return;
 
         string text = File.ReadAllText(path);
-        var    data = Newtonsoft.Json.JsonConvert.DeserializeObject<ConfigData>(text);
+        var    data = JsonConvert.DeserializeObject<ConfigData>(text);
 
-        if (data.ApiKey != null)
+        if (data is null)
+            return;
+        if (!string.IsNullOrWhiteSpace(data.ApiKey))
             _apiKey = data.ApiKey;
-        if (data.Name != null)
-            _name = data.Name;
-        if (data.Prompt  != null)
+        if (!string.IsNullOrWhiteSpace(data.Prompt))
             _prompt = data.Prompt;
-        if (data.MaxTokens  != null)
+        if (!string.IsNullOrWhiteSpace(data.SysPrompt))
+            _sysPrompt = data.SysPrompt;
+        if (!string.IsNullOrWhiteSpace(data.GirlName))
+            _girlName = data.GirlName;
+        if (!string.IsNullOrWhiteSpace(data.YourName))
+            _yourName = data.YourName;
+        if (data.MaxTokens is not null)
             _maxTokens = data.MaxTokens.Value;
-        if (data.Temperature  != null)
+        if (data.Temperature is not null)
             _temperature = data.Temperature.Value;
-        if (data.Debug != null)
+        if (data.Debug is not null)
             Debug = data.Debug.Value;
+    }
+
+    static partial class LocalRegularExpressions
+    {
+        const RegexOptions Options = RegexOptions.IgnoreCase | RegexOptions.Multiline;
+
+        [GeneratedRegex("\\$\\{?[pP][rR][oO][mM][tT]\\}?", Options)]
+        internal static partial Regex Prompt();
+
+        [GeneratedRegex("\\$\\{?GirlName\\}?", Options)]
+        internal static partial Regex GirlName();
+
+        [GeneratedRegex("\\$\\{?YourName\\}?", Options)]
+        internal static partial Regex YourName();
+    }
+
+    static string ReplaceInPrompt(string prompt)
+    {
+        prompt = LocalRegularExpressions.Prompt().Replace(prompt, _prompt);
+        prompt = LocalRegularExpressions.GirlName().Replace(prompt, _girlName);
+        prompt = LocalRegularExpressions.YourName().Replace(prompt, _yourName);
+
+        return prompt;
     }
 }

@@ -1,7 +1,9 @@
 {
     "ApiKey": "",
-    "Name": "Emily",
-    "Prompt": "Act like you are a human girl named $NAME. You are alone with your boyfriend.",
-    "MaxTokens": 512,
+    "GirlName": "Emily",
+    "YourName": "Jack",
+    "Prompt": "(This dialogue should be sexual in nature)\nWrite a brief response to this prompt from the perspective of ${GirlName}.\n\n${MESSAGE}\n\n",
+    "SysPrompt": "You are a young woman named ${GirlName}. You are having sex with your boyfriend ${YourName}.",
+    "MaxTokens": 256,
     "Debug": false
 }

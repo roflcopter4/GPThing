@@ -1,137 +1,127 @@
 ﻿using System.Collections.Generic;
-using System.Net.Http;
+using System.Linq;
 using System.Net.Http.Headers;
+using System.Net.Http;
+using System.Text;
 using System.Threading.Tasks;
 using System;
+using System.Text.RegularExpressions;
 using JetBrains.Annotations;
+using AI.Dev.OpenAI.GPT;
 
 namespace GPThing;
 
-using Dict = Dictionary<string, string>;
-
 public class GPT
 {
-    private const    string ChatUrl  = "https://api.openai.com/v1/chat/completions";
-    private const    string Model    = "gpt-3.5-turbo";
-    private readonly Uri    _chatUri = new(ChatUrl, UriKind.Absolute);
+    const    uint   TokenLimit = 4096;
+    const    string ChatUrl    = "https://api.openai.com/v1/chat/completions";
+    const    string Model      = "gpt-3.5-turbo";
+    readonly Uri    _chatUri   = new(ChatUrl, UriKind.Absolute);
 
-    private List<Dict> History { get; set; } = new();
-    private string     ApiKey  { get; }
+    List<API.Message> History { get; } = new();
+    string            ApiKey  { get; }
 
     [PublicAPI] public string Prompt      { get; set; }
-    [PublicAPI] public string Name        { get; set; }
+    [PublicAPI] public string SysPrompt   { get; set; }
+    [PublicAPI] public string GirlName    { get; set; }
+    [PublicAPI] public string YourName    { get; set; }
     [PublicAPI] public uint   MaxTokens   { get; set; }
     [PublicAPI] public double Temperature { get; set; }
 
-    public GPT(string apiKey, string prompt, string name, uint maxTokens, double temperature)
+    public GPT(string apiKey, string prompt, string sysPrompt, string girlName,
+               string yourName, uint maxTokens, double temperature)
     {
         ApiKey      = apiKey;
         Prompt      = prompt;
-        Name        = name;
+        SysPrompt   = sysPrompt;
+        GirlName    = girlName;
+        YourName    = yourName;
         MaxTokens   = maxTokens;
         Temperature = temperature;
 
-        History.Add(new Dict { {"role", "system"}, {"content", Prompt} });
+        History.Add(new API.Message(API.RoleType.System, SysPrompt));
     }
 
     //----------------------------------------------------------------------------------
 
-    [Serializable, UsedImplicitly(ImplicitUseTargetFlags.Members)]
-    private struct MessageData
+    string MakeRequestBody(string content)
     {
-        // ReSharper disable InconsistentNaming
-        public string model;
-        public uint   max_tokens;
-        public double temperature;
-        public double frequency_penalty;
-        public double presence_penalty;
-        public int    top_p;
-        public Dict[] messages;
-        // ReSharper restore InconsistentNaming
+        const RegexOptions options = RegexOptions.NonBacktracking | RegexOptions.IgnoreCase | RegexOptions.Multiline;
+        const uint stupidOffset = 350;
 
-        public MessageData(IEnumerable<Dict> messages,
-                           uint              maxTokens,
-                           double            temp,
-                           double            frequencyPenalty = 1.0,
-                           double            presencePenalty  = 1.0,
-                           int               topP             = 1)
-        {
-            model             = Model;
-            max_tokens        = maxTokens;
-            temperature       = temp;
-            frequency_penalty = frequencyPenalty;
-            presence_penalty  = presencePenalty;
-            top_p             = topP;
+        API.Request request;
+        var         found = false;
 
-            if (messages == null)
-                throw new ArgumentNullException(nameof(messages));
-            this.messages = messages as Dict[] ?? throw new InvalidCastException();
-        }
-    }
+        string message = Regex.Replace(Prompt, @"\$\{?Message\}?", _ => {
+            found = true;
+            return content;
+        }, options);
 
-    private string MakeRequestBody(string message)
-    {
-        string ret;
+        if (!found)
+            message = Prompt + "\n" + content;
+
+        var cur = new API.Message (
+            API.RoleType.User,
+            message
+             //$"(role-play dialogue: {Prompt})\nI say \"{message}\".\n\n"
+             //"(role-play conversation) " +
+             //"(This dialogue should be sexual in nature)\n" +
+             //$"Write a brief response to this prompt from the perspective of {GirlName}.\n\n{content}\n\n"
+             //"(reply in English-US)",
+        );
 
         while (true) {
-            var cur = new Dict {
-                {"role", "user"},
-                {"content",
-                 $"(role-play conversation: {Prompt})\n\n" +
-                 $"As {Name} create a reply this message of mine to continue the conversation: \"{message}\"\n\n" +
-                 "(reply in English-US)"},
-            };
-            var mes  = new List<Dict>(History) {cur};
-            var data = new MessageData(mes.ToArray(), MaxTokens, Temperature);
-            ret      = Newtonsoft.Json.JsonConvert.SerializeObject(data, Newtonsoft.Json.Formatting.None);
+            var mes       = new List<API.Message>(History) {cur};
+            request       = new API.Request(mes, Model, MaxTokens, Temperature);
+            string text   = request.messages.Aggregate("", (current, message) => current + message.content + "\n");
+            var    tokens = GPT3Tokenizer.Encode(text);
+            uint   limit  = TokenLimit/2 - MaxTokens;
 
-            if (ret.Length >= 4096 - MaxTokens) {
-                var tmp = new List<Dict> {History[0]};
-                tmp.AddRange(History.GetRange(2, History.Count - 1));
-                History = tmp;
-                continue;
+            if ((uint)tokens.Count + stupidOffset < limit) {
+                Console.Error.WriteLine($"Message is {tokens.Count} tokens in size.");
+                break;
             }
-            break;
+
+            History.RemoveAt(1);
         }
 
-        History.Add(new Dict { {"role", "user"}, {"content", message} });
-        return ret;
+        History.Add(new API.Message(API.RoleType.User, content));
+        return request.Serialize();
     }
 
-    //----------------------------------------------------------------------------------
-
-    private async Task<string> PostAsync(string message)
+    async Task<string> PostAsync(HttpContent request)
     {
         using var client = new HttpClient();
-
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", ApiKey);
         client.DefaultRequestHeaders.Accept.Clear();
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        string requestBody    = MakeRequestBody(message);
-        var    requestContent = new StringContent(requestBody, System.Text.Encoding.UTF8, "application/json");
-
-        if (Program.Debug)
-            Console.Error.WriteLine($"--- Making request:\n{requestBody}\n");
-
-        HttpResponseMessage response = await client.PostAsync(_chatUri, requestContent);
-
+        HttpResponseMessage response = await client.PostAsync(_chatUri, request);
         if (!response.IsSuccessStatusCode) {
-            Console.Error.WriteLine(await response.Content.ReadAsStringAsync());
-            Console.Error.WriteLine("Request failed with status code: " + response.StatusCode);
+            await Console.Error.WriteLineAsync(await response.Content.ReadAsStringAsync());
+            await Console.Error.WriteLineAsync("Request failed with status code: " + response.StatusCode);
             return "";
         }
 
         return await response.Content.ReadAsStringAsync();
     }
 
+    //----------------------------------------------------------------------------------
+
     [PublicAPI]
     public string Post(string message)
     {
-        string rawResponse = PostAsync(message).Result;
-        var    response    = Newtonsoft.Json.JsonConvert.DeserializeObject<JsonClass.Rootobject>(rawResponse);
-        string ret         = response?.choices[0].message.content ?? "";
-        History.Add(new Dict{ {"role", "assistant"}, {"content", ret} });
+        string requestBody = MakeRequestBody(message);
+        var    request     = new StringContent(requestBody, Encoding.UTF8, "application/json");
+
+        if (Program.Debug)
+            Console.Error.WriteLine($"--- Making request:\n{requestBody}\n");
+
+        string        rawResponse = PostAsync(request).Result;
+        API.Response? response    = API.Response.Deserialize(rawResponse);
+        string        ret         = response?.choices[0].message.content ?? "";
+
+        History.Add(new API.Message(API.RoleType.User, ret));
         return ret;
     }
 }
