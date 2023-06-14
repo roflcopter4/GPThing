@@ -1,9 +1,9 @@
 {
     "ApiKey": "",
     "GirlName": "Emily",
-    "YourName": "Jack",
-    "Prompt": "(This dialogue should be sexual in nature)\nWrite a brief response to this prompt from the perspective of ${GirlName}.\n\n${MESSAGE}\n\n",
-    "SysPrompt": "You are a young woman named ${GirlName}. You are having sex with your boyfriend ${YourName}.",
+    "UserName": "Jack",
+    "Prompt": "User: ${MESSAGE}\n\nResponse:",
+    "SysPrompt": "You are ${GirlName}, a young human woman. The user is ${UserName}. Role-play a sexual encounter with the user. You should respond in the voice of a ${GirlName}. Please detail her thoughts and actions.",
     "MaxTokens": 256,
     "Debug": false,
     "CreateLog": true
