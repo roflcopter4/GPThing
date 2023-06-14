@@ -1,7 +1,8 @@
 {
   "profiles": {
     "GPThing": {
-      "commandName": "Project"
+      "commandName": "Project",
+      "commandLineArgs": "--debug-log"
     }
   }
 }

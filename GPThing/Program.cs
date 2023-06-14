@@ -1,14 +1,14 @@
 ﻿using System;
 using System.IO;
 using System.Reflection;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.CommandLine;
 using System.CommandLine.Binding;
 using System.CommandLine.Builder;
 using System.CommandLine.Invocation;
 using System.CommandLine.Parsing;
-using System.Text.RegularExpressions;
 using JetBrains.Annotations;
-using Newtonsoft.Json;
 
 #pragma warning disable CS0649
 
@@ -16,45 +16,32 @@ namespace GPThing;
 
 internal static partial class Program
 {
-    const double DefaultTemperature = 1.06;
-    const uint   DefaultMaxTokens   = 256;
-    const string DefaultGirlName    = "Emily";
-    const string DefaultYourName    = "Jack";
-    const string DefaultPrompt      = "Act like you are a human girl named $NAME.";
-    const string DefaultSysPrompt   = "(This dialogue should be sexual in nature)\nWrite a brief response to this prompt from the perspective of {GirlName}.\n\n${MESSAGE}\n\n.";
-
     static readonly ConsoleColor OriginalColor = Console.ForegroundColor;
+    static readonly string?      ExePath       = Path.GetDirectoryName(Assembly.GetEntryAssembly()?.Location);
 
-    static double  _temperature = DefaultTemperature;
-    static uint    _maxTokens   = DefaultMaxTokens;
-    static string  _prompt      = DefaultPrompt;
-    static string  _girlName    = DefaultGirlName;
-    static string  _yourName    = DefaultYourName;
-    static string  _sysPrompt   = DefaultSysPrompt;
+    static StreamWriter? _conversationLog;
+
+    static double? _temperature;
+    static double? _topP;
+    static double? _presencePenalty;
+    static double? _frequencyPenalty;
+    static uint?   _maxTokens;
+    static string? _prompt;
+    static string? _girlName;
+    static string? _yourName;
+    static string? _sysPrompt;
     static string? _apiKey;
+    static bool    _debugLog;
 
     internal static bool Debug { private set; get; }
 
-    static void Main(string[] args)
+    static void Main(string[] argv)
     {
         ReadConfigFile();
-        HandleParams(args);
+        HandleParams(argv);
+        _conversationLog = GetConversationLogFilename();
 
-        _prompt    = ReplaceInPrompt(_prompt);
-        _sysPrompt = ReplaceInPrompt(_sysPrompt);
-
-        if (Debug) {
-            Console.Error.WriteLine($"{nameof(_apiKey)}:      \"{_apiKey}\"");
-            Console.Error.WriteLine($"{nameof(_maxTokens)}:   \"{_maxTokens}\"");
-            Console.Error.WriteLine($"{nameof(_temperature)}: \"{_temperature}\"");
-            Console.Error.WriteLine($"{nameof(_girlName)}:    \"{_girlName}\"");
-            Console.Error.WriteLine($"{nameof(_yourName)}:    \"{_yourName}\"");
-            Console.Error.WriteLine($"{nameof(_prompt)}:      \"{_prompt}\"");
-            Console.Error.WriteLine($"{nameof(_sysPrompt)}:   \"{_sysPrompt}\"");
-            Console.Error.WriteLine();
-        }
-
-        if (string.IsNullOrEmpty(_apiKey)) {
+        if (string.IsNullOrWhiteSpace(_apiKey)) {
             Console.ForegroundColor = ConsoleColor.Red;
             Console.Error.Write("FATAL ERROR: ");
             Console.ForegroundColor = OriginalColor;
@@ -62,43 +49,166 @@ internal static partial class Program
             Environment.Exit(1);
         }
 
-        var gpt = new GPT(_apiKey, _prompt, _sysPrompt, _girlName, _yourName, _maxTokens, _temperature);
+        var gpt = new GPT(_apiKey, _prompt, _sysPrompt, _girlName, _yourName)
+        {
+            DebugLog = (Debug || _debugLog) && ExePath is not null
+                           ? new StreamWriter(Path.Combine(ExePath, "debug.log"), false)
+                           : null,
+        };
+        if (_temperature      is not null) gpt.Temperature      = _temperature.Value;
+        if (_topP             is not null) gpt.TopP             = _topP.Value;
+        if (_maxTokens        is not null) gpt.MaxTokens        = _maxTokens.Value;
+        if (_presencePenalty  is not null) gpt.PresencePenalty  = _presencePenalty.Value;
+        if (_frequencyPenalty is not null) gpt.FrequencyPenalty = _frequencyPenalty.Value;
 
-        for (;;) {
+        Console.ForegroundColor = ConsoleColor.Magenta;
+        Console.WriteLine("System:");
+        Console.ForegroundColor = OriginalColor;
+        Console.Write(gpt.SysPrompt + "\n\n");
+
+        for (;;)
+        {
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine("User:");
             Console.ForegroundColor = OriginalColor;
 
-            var input = "";
-            int ch;
-            do {
-                uint nread = 0;
-                for (;;) {
-                    ch = Console.Read();
-                    switch (ch) {
-                    case <= 0: return;
-                    case '\r': continue;
-                    case '\n': goto breakout;
-                    }
-                    input += (char)ch;
-                    ++nread;
-                }
-            breakout:
-                if (nread > 0 && input is [.., '\\']) {
-                    input = input.Remove(input.Length - 1) + "\n";
-                    ch    = '\\';
-                }
-            } while (ch == '\\' || input.Length == 0);
+            string input = GetUserInput();
 
-            if (Debug)
-                Console.Error.WriteLine("Input: \"{0}\"", input);
+            if (input is ['!', _, ..]) {
+                // System command. Modify parameters.
+                ParseCommand.Parse(ref gpt, input[1..].Trim());
+            } else {
+                // Normal user message. Send as a request.
+                string response = gpt.Post(input);
 
-            string response = gpt.Post(input);
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine("\nAI:");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write("\nAI:\n");
+                Console.ForegroundColor = OriginalColor;
+                Console.Write(response + "\n\n");
+
+                if (_conversationLog is not null) {
+                    _conversationLog.Write($"***** USER *****\n{input}\n\n" +
+                                           $"*****  AI  *****\n{response}\n\n");
+                    _conversationLog.Flush();
+                }
+            }
+        }
+    }
+
+    //----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Gets a line of user input, possibly containing escaped newlines. Blocks only for
+    /// the first character. Exits upon EOF.
+    /// </summary>
+    static string GetUserInput()
+    {
+        var input = "";
+        int ch;
+
+        do {
+            var nread = 0;
+            for (;;) {
+                ch = Console.Read();
+                switch (ch) {
+                case <= 0: Environment.Exit(0); break; // EOF
+                case '\r': continue;
+                case '\n': goto breakout;
+                }
+
+                input += (char)ch;
+                ++nread;
+            }
+
+        breakout:
+            if (nread > 0 && input is [.., '\\']) {
+                input = input.Remove(input.Length - 1) + "\n";
+                ch    = '\\';
+            }
+        } while (ch == '\\' || input.Length == 0);
+
+        return input;
+    }
+
+    static StreamWriter? GetConversationLogFilename()
+    {
+        if (string.IsNullOrEmpty(ExePath))
+            return null;
+
+        string logPath = Path.Combine(ExePath, "Logs");
+        if (!Path.Exists(logPath))
+            Directory.CreateDirectory(logPath);
+
+        var path = "";
+
+        for (uint i = 0; i < 99999; ++i) {
+            path = Path.Combine(logPath, $"ConversationLog_{i:D5}.txt");
+            if (!Path.Exists(path))
+                break;
+        }
+
+        return Path.Exists(path) ? null : new StreamWriter(path, false);
+    }
+
+    static partial class ParseCommand
+    {
+        const RegexOptions Options = RegexOptions.IgnoreCase;
+
+        [GeneratedRegex(@"(?:^set\s*)?\b(?:max(?:[_ ]?tokens)?)\b\s*=?\s*(?<val>\d+)", Options)]
+        private static partial Regex SetMaxTokens();
+
+        [GeneratedRegex(@"(?:^set\s*)?\b(?:temp(?:erature)?)\b\s*=?\s*(?<val>\d+)", Options)]
+        private static partial Regex SetTemperature();
+
+        [GeneratedRegex(@"\b^exit\b", Options)]
+        private static partial Regex Exit();
+
+        public static void Parse(ref GPT gpt, string command)
+        {
+            // ReSharper disable once JoinDeclarationAndInitializer
+            Match m;
+
+            m = SetMaxTokens().Match(command);
+            if (m.Success) {
+                string val = m.Groups["val"].Value;
+                try {
+                    uint number = uint.Parse(m.Groups["val"].Value);
+                    if (number > 4096)
+                        number = 4096;
+                    gpt.MaxTokens = number;
+                }
+                catch (Exception e) when (e is FormatException or OverflowException) {
+                    Console.Error.WriteLine($"Error parsing number \"{val}\"");
+                }
+
+                return;
+            }
+
+            m = SetTemperature().Match(command);
+            if (m.Success) {
+                string val = m.Groups["val"].Value;
+                try {
+                    double number = double.Parse(m.Groups["val"].Value);
+                    gpt.Temperature = number switch {
+                        > 2.0 => 2.0,
+                        < 0.0 => 0.0,
+                        _     => number,
+                    };
+                }
+                catch (Exception e) when (e is FormatException or OverflowException) {
+                    Console.Error.WriteLine($"Error parsing number \"{val}\"");
+                }
+
+                return;
+            }
+
+            if (Exit().IsMatch(command))
+                Environment.Exit(0);
+
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Write("error: ");
             Console.ForegroundColor = OriginalColor;
-            Console.WriteLine(response);
-            Console.WriteLine();
+            Console.Write("unknown command\n\n");
         }
     }
 
@@ -106,29 +216,29 @@ internal static partial class Program
 
     static void HandleParams(string[] args)
     {
-        var optPrompt = new Option<string>(
+        var optPrompt = new Option<string?>(
             name: "--prompt",
-            description: "The prompt which is prepended (with other data) before each message and at the start if no Long Prompt is specified.",
+            description: "The prompt which is prepended (with other data) before each message.",
             getDefaultValue: () => _prompt);
         optPrompt.AddAlias("-p");
 
-        var optSysPrompt = new Option<string>(
-            name: "--full-prompt",
-            description: "The prompt to give OpenAI at the start of the conversation. You may wish to make it more detailed than the general prompt.",
+        var optSysPrompt = new Option<string?>(
+            name: "--sys-prompt",
+            description: "The prompt to give OpenAI at the start of the conversation..",
             getDefaultValue: () => _sysPrompt);
         optPrompt.AddAlias("-P");
 
-        var optGirlName = new Option<string>(
-            name: "--name",
+        var optGirlName = new Option<string?>(
+            name: "--girl-name",
             description: "The name OpenAI should adopt.",
             getDefaultValue: () => _girlName);
         optGirlName.AddAlias("-n");
 
-        var optYourName = new Option<string>(
-            name: "--yourname",
+        var optUserName = new Option<string?>(
+            name: "--your-name",
             description: "The name OpenAI should use to refer to you.",
             getDefaultValue: () => _yourName);
-        optYourName.AddAlias("-N");
+        optUserName.AddAlias("-N");
 
         var optKey = new Option<string?>(
             name: "--key",
@@ -136,39 +246,67 @@ internal static partial class Program
             getDefaultValue: () => _apiKey);
         optKey.AddAlias("-k");
 
-        var optMaxTokens = new Option<uint>(
+        var optMaxTokens = new Option<uint?>(
             name: "--maxtokens",
-            description: "The maximum tokens OpenAI should send in one message (default 512).",
+            description: "The maximum tokens OpenAI should send in one message.",
             getDefaultValue: () => _maxTokens);
         optMaxTokens.AddAlias("-M");
 
-        var optTemp = new Option<double>(
+        var optTemperature = new Option<double?>(
             name: "--temperature",
             description: "The temperature setting for OpenAI.",
             getDefaultValue: () => _temperature);
-        optTemp .AddAlias("-T");
+        optTemperature.AddAlias("-t");
+
+        var optTopP = new Option<double?>(
+            name: "--top-p",
+            description: "The TopP setting for OpenAI.",
+            getDefaultValue: () => _topP);
+        optTopP.AddAlias("-T");
+
+        var optPresencePenalty = new Option<double?>(
+            name: "--presence-penalty",
+            description: "The presence penalty setting for OpenAI.",
+            getDefaultValue: () => _presencePenalty);
+
+        var optFrequencyPenalty = new Option<double?>(
+            name: "--frequency-penalty",
+            description: "The frequency penalty setting for OpenAI.",
+            getDefaultValue: () => _frequencyPenalty);
 
         var optDebug = new Option<bool>(
             name: "--debug",
             description: "Debugging mode.",
-            getDefaultValue: () => Debug)
-        { IsHidden = true };
+            getDefaultValue: () => Debug);
 
-        var rootCommand = new RootCommand("This app eases one's ability to talk sexy to a pattern matching algorithm.") {
-            optPrompt, optSysPrompt, optGirlName, optYourName, optKey, optMaxTokens, optTemp, optDebug
+        var optDebugLog = new Option<bool>(
+            name: "--debug-log",
+            description: "Make a debugging log without enabling full debug-mode.",
+            getDefaultValue: () => _debugLog);
+        optDebugLog.AddAlias("-D");
+
+        var rootCommand = new RootCommand(
+            "This app eases one's ability to talk sexy to a pattern matching algorithm.") {
+            optPrompt, optSysPrompt, optGirlName, optUserName, optKey, optMaxTokens,
+            optTemperature, optTopP, optPresencePenalty, optFrequencyPenalty,
+            optDebug, optDebugLog,
         };
 
         rootCommand.SetHandler(
             context =>
             {
-                _prompt      = GetValueForHandlerParameter<string>(optPrompt, context)!;
-                _sysPrompt   = GetValueForHandlerParameter<string>(optSysPrompt, context)!;
-                _girlName    = GetValueForHandlerParameter<string>(optGirlName, context)!;
-                _yourName    = GetValueForHandlerParameter<string>(optYourName, context)!;
-                _apiKey      = GetValueForHandlerParameter<string?>(optKey, context);
-                _maxTokens   = GetValueForHandlerParameter<uint>(optMaxTokens, context);
-                _temperature = GetValueForHandlerParameter<double>(optTemp, context);
-                Debug        = GetValueForHandlerParameter<bool>(optDebug, context);
+                _prompt           = GetValueForHandlerParameter<string?>(optPrompt, context)!;
+                _sysPrompt        = GetValueForHandlerParameter<string?>(optSysPrompt, context)!;
+                _girlName         = GetValueForHandlerParameter<string?>(optGirlName, context)!;
+                _yourName         = GetValueForHandlerParameter<string?>(optUserName, context)!;
+                _apiKey           = GetValueForHandlerParameter<string?>(optKey, context);
+                _maxTokens        = GetValueForHandlerParameter<uint?>(optMaxTokens, context);
+                _temperature      = GetValueForHandlerParameter<double?>(optTemperature, context);
+                _topP             = GetValueForHandlerParameter<double?>(optTopP, context);
+                _frequencyPenalty = GetValueForHandlerParameter<double?>(optFrequencyPenalty, context);
+                _presencePenalty  = GetValueForHandlerParameter<double?>(optPresencePenalty, context);
+                Debug             = GetValueForHandlerParameter<bool>(optDebug, context);
+                _debugLog         = GetValueForHandlerParameter<bool>(optDebugLog, context);
             });
 
         var    isHelp = false;
@@ -178,88 +316,65 @@ internal static partial class Program
             Environment.Exit(0);
     }
 
-    static T? GetValueForHandlerParameter<T>(IValueDescriptor symbol, InvocationContext context)
+    static TP? GetValueForHandlerParameter<TP>(IValueDescriptor symbol, InvocationContext context)
     {
         if (symbol is IValueSource valueSource &&
             valueSource.TryGetValue(symbol, context.BindingContext, out object? boundValue) &&
-            boundValue is T value)
+            boundValue is TP value)
+        {
             return value;
+        }
 
         return symbol switch {
-            Argument<T> argument => context.ParseResult.GetValueForArgument(argument),
-            Option<T> option     => context.ParseResult.GetValueForOption(option),
-            _                    => throw new ArgumentOutOfRangeException(nameof(symbol)),
+            Argument<TP> argument => context.ParseResult.GetValueForArgument(argument),
+            Option<TP> option     => context.ParseResult.GetValueForOption(option),
+            _                     => throw new ArgumentOutOfRangeException(nameof(symbol)),
         };
     }
 
     //----------------------------------------------------------------------------------
 
-    [Serializable, UsedImplicitly]
+    [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
     class ConfigData
     {
         public string? ApiKey;
         public string? Prompt;
         public string? SysPrompt;
         public string? GirlName;
-        public string? YourName;
+        public string? UserName;
         public uint?   MaxTokens;
         public double? Temperature;
+        public double? PresencePenalty;
+        public double? FrequencyPenalty;
         public bool?   Debug;
     }
 
     static void ReadConfigFile()
     {
-        string? path = Path.GetDirectoryName(Assembly.GetEntryAssembly()?.Location);
-        if (path is null)
+        if (ExePath is null)
             return;
-        path = Path.Combine(path, "config.json");
-
+        string path = Path.Combine(ExePath, "config.json");
         if (!File.Exists(path))
             return;
 
         string text = File.ReadAllText(path);
-        var    data = JsonConvert.DeserializeObject<ConfigData>(text);
+        var options = new JsonSerializerOptions {IncludeFields = true};
+        var data    = JsonSerializer.Deserialize<ConfigData>(text, options);
 
         if (data is null)
             return;
         if (!string.IsNullOrWhiteSpace(data.ApiKey))
             _apiKey = data.ApiKey;
-        if (!string.IsNullOrWhiteSpace(data.Prompt))
-            _prompt = data.Prompt;
-        if (!string.IsNullOrWhiteSpace(data.SysPrompt))
-            _sysPrompt = data.SysPrompt;
-        if (!string.IsNullOrWhiteSpace(data.GirlName))
-            _girlName = data.GirlName;
-        if (!string.IsNullOrWhiteSpace(data.YourName))
-            _yourName = data.YourName;
-        if (data.MaxTokens is not null)
-            _maxTokens = data.MaxTokens.Value;
-        if (data.Temperature is not null)
-            _temperature = data.Temperature.Value;
         if (data.Debug is not null)
             Debug = data.Debug.Value;
-    }
 
-    static partial class LocalRegularExpressions
-    {
-        const RegexOptions Options = RegexOptions.IgnoreCase | RegexOptions.Multiline;
-
-        [GeneratedRegex("\\$\\{?[pP][rR][oO][mM][tT]\\}?", Options)]
-        internal static partial Regex Prompt();
-
-        [GeneratedRegex("\\$\\{?GirlName\\}?", Options)]
-        internal static partial Regex GirlName();
-
-        [GeneratedRegex("\\$\\{?YourName\\}?", Options)]
-        internal static partial Regex YourName();
-    }
-
-    static string ReplaceInPrompt(string prompt)
-    {
-        prompt = LocalRegularExpressions.Prompt().Replace(prompt, _prompt);
-        prompt = LocalRegularExpressions.GirlName().Replace(prompt, _girlName);
-        prompt = LocalRegularExpressions.YourName().Replace(prompt, _yourName);
-
-        return prompt;
+        _prompt           = data.Prompt;
+        _sysPrompt        = data.SysPrompt;
+        _girlName         = data.GirlName;
+        _yourName         = data.UserName;
+        _maxTokens        = data.MaxTokens;
+        _temperature      = data.Temperature;
+        _presencePenalty  = data.PresencePenalty;
+        _frequencyPenalty = data.FrequencyPenalty;
     }
 }

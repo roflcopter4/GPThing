@@ -2,12 +2,10 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
+using System.Text.Json;
 using JetBrains.Annotations;
-using Newtonsoft.Json;
 
 #pragma warning disable CS8618
-#pragma warning disable IDE1006
-// ReSharper disable MemberHidesStaticFromOuterClass
 // ReSharper disable InconsistentNaming
 
 namespace GPThing;
@@ -27,39 +25,40 @@ public static class API
         };
     }
 
-    [Serializable, UsedImplicitly]
+    [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
     public class Response
     {
-        public string   id      { get; set; }
-        public string   _object { get; set; }
-        public int      created { get; set; }
-        public string   model   { get; set; }
-        public Usage    usage   { get; set; }
-        public Choice[] choices { get; set; }
+        public string   id;
+        public string   _object;
+        public int      created;
+        public string   model;
+        public Usage    usage;
+        public Choice[] choices;
 
-        [Serializable, UsedImplicitly]
+        [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
         public class Usage
         {
-            public int prompt_tokens     { get; set; }
-            public int completion_tokens { get; set; }
-            public int total_tokens      { get; set; }
+            public int prompt_tokens;
+            public int completion_tokens;
+            public int total_tokens;
         }
 
-        [Serializable, UsedImplicitly]
+        [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
         public class Choice
         {
-            public Message message       { get; set; }
-            public string  finish_reason { get; set; }
-            public int     index         { get; set; }
+            public Message message;
+            public string  finish_reason;
+            public int     index;
         }
 
         public static Response? Deserialize(string data)
         {
-            return JsonConvert.DeserializeObject<Response>(data);
+            var options = new JsonSerializerOptions {IncludeFields = true};
+            return JsonSerializer.Deserialize<Response>(data, options);
         }
     }
 
-    [Serializable, UsedImplicitly]
+    [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
     public class Request
     {
         public Message[] messages;
@@ -68,7 +67,7 @@ public static class API
         public double    temperature;
         public double    frequency_penalty;
         public double    presence_penalty;
-        public int       top_p;
+        //public double    top_p;
 
         public Request(
                 IEnumerable<Message> messageList,
@@ -77,7 +76,7 @@ public static class API
                 double               temp,
                 double               frequencyPenalty = 1.0,
                 double               presencePenalty  = 1.0,
-                int                  topP             = 1)
+                double               topP             = 1.0)
         {
             if (messageList is null)
                 throw new ArgumentNullException(nameof(messageList));
@@ -89,21 +88,21 @@ public static class API
             temperature       = temp;
             frequency_penalty = frequencyPenalty;
             presence_penalty  = presencePenalty;
-            top_p             = topP;
+            //top_p             = topP;
         }
 
         public string Serialize()
         {
-            Formatting fmt = Program.Debug ? Formatting.Indented : Formatting.None;
-            return JsonConvert.SerializeObject(this, fmt);
+            var options = new JsonSerializerOptions {WriteIndented = Program.Debug, IncludeFields = true};
+            return JsonSerializer.Serialize(this, options);
         }
     }
 
-    [Serializable, UsedImplicitly]
+    [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
     public class Message
     {
-        public string role    { get; set; }
-        public string content { get; set; }
+        public string role;
+        public string content;
 
         public Message() {}
         public Message(RoleType role, string content)
